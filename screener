@@ -1,0 +1,330 @@
+import pandas as pd
+import numpy as np
+import requests
+import matplotlib.pyplot as plt
+import renko
+import time
+import renko_tradition as trenko
+import difflib
+import datetime
+import os
+
+from config import *
+from adx import *
+
+api_key = API_KEY
+api_keys = ["d6d2aad8623d415092c2d9c4eb03b9ca", "365d64328b304bdcafd61695a2557c8f", "79ddd4c8df0545c994a09a4c312c55a3",
+            "eca064abec9a4c2e918a8d0b3eefd188", "4c54e723511a4c82ba4913ecc83eb201", "a363e93f20fe441cb2b841eb5d308f8b"]
+highInterval = HighTimeFrame
+lowInterval = LowTimeFrame
+highWick = HighWick
+lowWick = LowWick
+loopback = LookBack
+
+nHighBricks = HighNumBricks
+nLowBricks = LowNumBricks
+isAtr = IsATR
+boxSize = RenkoBoxSize
+nAtr = RenkoATR
+
+
+def get_atr_bricksize(data):
+    df_high = data[0]
+    df_low = data[1]
+    renko_high = renko.renko()
+    renko_low = renko.renko()
+    if not isAtr:
+        return boxSize, boxSize
+    else:
+        optimal_brick_high = renko_high.set_brick_size(auto=True, HLC_history=df_high[["high", "low", "close"]])
+        optimal_brick_low = renko_low.set_brick_size(auto=True, HLC_history=df_low[["high", "low", "close"]])
+        return optimal_brick_high, optimal_brick_low
+
+
+def screener_atr(data):
+    df_high = data[0]
+    df_low = data[1]
+    renko_high = renko.renko()
+    renko_low = renko.renko()
+    if not isAtr:
+        renko_high.set_brick_size(auto=False, brick_size=boxSize)
+        renko_low.set_brick_size(auto=False, brick_size=boxSize)
+    else:
+        optimal_brick_high = renko_high.set_brick_size(auto=True, HLC_history=df_high[["high", "low", "close"]])
+        optimal_brick_low = renko_low.set_brick_size(auto=True, HLC_history=df_low[["high", "low", "close"]])
+        renko_high.set_brick_size(auto=False, brick_size=optimal_brick_high)
+        renko_low.set_brick_size(auto=False, brick_size=optimal_brick_high)
+
+    # Emulation that how it will be going when data is streaming from provider/exchange
+    renko_high.build_history(prices=df_high.close)
+    renko_low.build_history(prices=df_low.close)
+    high_directions = renko_high.get_renko_directions()
+    high_last = high_directions[-1]
+    low_directions = renko_low.get_renko_directions()
+    low_last = low_directions[-1]
+
+    if high_last != low_last:
+        return False, None
+
+    for i in range(1, nHighBricks + 1):
+        if high_directions[-i - 1] != high_last:
+            return False, None
+    for i in range(1, nLowBricks + 1):
+        if low_directions[-i - 1] != low_last:
+            return False, None
+
+    if high_last == 1:
+        trend = "UP"
+    else:
+        trend = "DOWN"
+    return True, trend
+
+
+def screener(data, high_brick, low_brick):
+    df_high = data[0]
+    df_low = data[1]
+    renko_high = trenko.Renko(df_high)
+    renko_low = trenko.Renko(df_low)
+
+    renko_high.brick_size = high_brick
+    renko_high.chart_type = trenko.Renko.PERIOD_CLOSE
+    renko_df_high = renko_high.get_ohlc_data()
+    high_trends = renko_df_high["uptrend"].tolist()
+
+    renko_low.brick_size = low_brick
+    renko_low.chart_type = trenko.Renko.PERIOD_CLOSE
+    renko_df_low = renko_low.get_ohlc_data()
+    low_trends = renko_df_low["uptrend"].tolist()
+    print(renko_df_high)
+    print(renko_df_low)
+
+    high_last = high_trends[-1]
+    low_last = low_trends[-1]
+
+    if high_last != low_last:
+        return False, None
+
+    for i in range(1, nHighBricks + 1):
+        if high_trends[-i - 1] != high_last:
+            return False, None
+    for i in range(1, nLowBricks + 1):
+        if low_trends[-i - 1] != low_last:
+            return False, None
+
+    if high_last == True:
+        trend = "UP"
+    else:
+        trend = "DOWN"
+    return True, trend
+
+
+def make_dataframe(res):
+    df = pd.DataFrame(res["values"])
+    df.columns = ["date", "open", "high", "low", "close", "volume"]
+    df["date"] = pd.to_datetime(df["date"])
+    df["open"] = df["open"].astype(float)
+    df["high"] = df["high"].astype(float)
+    df["low"] = df["low"].astype(float)
+    df["close"] = df["close"].astype(float)
+    df["volume"] = df["volume"].astype(int)
+    df = df.sort_values("date", ascending=True).reset_index(drop=True)
+    return df
+
+
+def handle_request(url, params, retries=0, max_retries=3):
+    if retries < max_retries:
+        res = requests.get(url, params=params).json()
+        status = res["status"]
+        if status == "ok":
+            return res
+        elif status == "error":
+            code = res["code"]
+            message = res["message"]
+            if code == 400 and "**symbol** not found" in message:
+                symbol = params["symbol"]
+                new_symbol = symbol_search(symbol)
+                if new_symbol:
+                    print(f"Replaced symbol {symbol} with {new_symbol}")
+                    params["symbol"] = new_symbol
+                    return handle_request(url, params)
+                else:
+                    raise Exception(f"Symbol {symbol} not found.")
+            elif code == 429:
+                retries += 1
+                print(f"Error: {message}")
+                print(f"Retrying {retries}/{max_retries}")
+                time.sleep(60)  # Free plan: 8 api call per minute
+                return handle_request(url, params, retries)
+            else:
+                raise Exception(f"Response error not handled. Response: {res}")
+        else:
+            raise Exception(f"Unknown response status. Response: {res}")
+    else:
+        raise Exception(f"Maximum retries reached for {url} with parameters {params}")
+
+
+def symbol_search(symbol):
+    sub_symbol = symbol[:2]
+    url = f"https://api.twelvedata.com/symbol_search?symbol={sub_symbol}"
+    res = requests.get(url).json()
+    data = res["data"]
+    if len(data) > 0:
+        all_symbols = [d["symbol"] for d in data]
+        matches = difflib.get_close_matches(symbol, all_symbols, n=1)
+        return matches[0]
+    else:
+        return None
+
+
+def get_ohlc(symbol, i, end_date):
+    print(f"Getting data for {symbol}")
+    api = api_keys[i % (len(api_keys))]
+    res_high = handle_request("https://api.twelvedata.com/time_series",
+                              params={"symbol": symbol, "interval": highInterval, "apikey": api,
+                                      "outputsize": loopback, "end_date": end_date})
+    res_low = handle_request("https://api.twelvedata.com/time_series",
+                             params={"symbol": symbol, "interval": lowInterval, "apikey": api,
+                                     "outputsize": loopback, "end_date": end_date})
+    df_high = make_dataframe(res_high)
+    df_low = make_dataframe(res_low)
+
+    return df_high, df_low
+
+
+def write_data(data, symbol):
+    directory = 'data'
+
+    df_high = data[0]
+    df_low = data[1]
+
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+    path_low = os.path.join(directory, f"{symbol}_low.csv")
+    path_high = os.path.join(directory, f"{symbol}_high.csv")
+    df_low.to_csv(path_low, index=False)
+    df_high.to_csv(path_high, index=False)
+
+
+def read_data(symbol):
+    directory = 'data'
+    path_low = os.path.join(directory, f"{symbol}_low.csv")
+    path_high = os.path.join(directory, f"{symbol}_high.csv")
+
+    df_high = pd.read_csv(path_high)
+    df_high["date"] = pd.to_datetime(df_high["date"])
+    df_high["open"] = df_high["open"].astype(float)
+    df_high["high"] = df_high["high"].astype(float)
+    df_high["low"] = df_high["low"].astype(float)
+    df_high["close"] = df_high["close"].astype(float)
+    df_high["volume"] = df_high["volume"].astype(int)
+    df_high = df_high.sort_values("date", ascending=True).reset_index(drop=True)
+
+    df_low = pd.read_csv(path_low)
+    df_low["date"] = pd.to_datetime(df_low["date"])
+    df_low["open"] = df_low["open"].astype(float)
+    df_low["high"] = df_low["high"].astype(float)
+    df_low["low"] = df_low["low"].astype(float)
+    df_low["close"] = df_low["close"].astype(float)
+    df_low["volume"] = df_low["volume"].astype(int)
+    df_low = df_low.sort_values("date", ascending=True).reset_index(drop=True)
+
+    return df_high, df_low
+
+
+def get_new_data(symbols, end_date):
+    for symbol, i in zip(symbols, range(len(symbols))):
+        try:
+            data = get_ohlc(symbol, i, end_date)
+        except Exception as e:
+            print(f"Exception for symbol {symbol}: {e}")
+            continue
+
+        write_data(data, symbol)
+
+
+def main():
+    true_values = ['y', 'yes']
+    only_run_adx = input("Only run ADX (default: N): ").lower() in true_values
+
+    if only_run_adx:
+        listed_df = pd.read_csv("output/ListedStock.csv")
+        adx_results = []
+        for index, row in listed_df.iterrows():
+            symbol = row["Symbol"]
+            trend = row["Trend"]
+            try:
+                data = read_data(symbol)
+            except Exception as e:
+                print(f"Exception for symbol {symbol}: {e}")
+                continue
+
+            adx_result = adx_filter(data[0])
+            if adx_result is not None:
+                adx_results.append({"Symbol": symbol, "Trend": trend, "Price": adx_result["close"],
+                                    "Volume": adx_result["volume"]})
+
+        write_adx(adx_results)
+    else:
+        default_n = "100"
+        default_end_date = datetime.date.today().strftime('%Y/%m/%d')
+        n = int(input(f"Enter number of symbols you want to go through(Default: {default_n}): ") or default_n)
+
+        print(f"Number of stocks: {n}")
+
+        symbols = pd.read_excel("input/StockList.xlsx")["Symbol"].tolist()[:n]
+
+        end_date = None
+        while end_date is None:
+            date_entry = input("Enter the end date (format: YYYY/MM/DD) (default: current): ") or default_end_date
+            try:
+                year, month, day = map(int, date_entry.split('/'))
+                end_date = datetime.datetime(year=year, month=month, day=day,
+                                             hour=23, minute=59, second=59, microsecond=999999)
+            except ValueError:
+                print(f"{date_entry} is not a valid date. Please provide the date in the format YYYY/MM/DD.")
+        print(f"End date: {end_date.date()}")
+        get_new_data(symbols, end_date)
+
+        listedSymbols = []
+        listedTrends = []
+        adx_results = []
+        for symbol, i in zip(symbols, range(len(symbols))):
+            try:
+                data = read_data(symbol)
+            except Exception as e:
+                print(f"Exception for symbol {symbol}: {e}")
+                continue
+                
+            if data[0].shape[0] <= nAtr or data[1].shape[0] <= nAtr:
+                print(f"Not enough data for {symbol}. Skipping symbol.")
+                continue
+
+            high_brick, low_brick = get_atr_bricksize(data)
+            print(high_brick, low_brick)
+            isListed, trend = screener(data, high_brick, low_brick)
+            print("\n=======================")
+            print(f"Symbol: {symbol}")
+            print(f"IsListed?: {isListed}")
+            print(f"Trend: {trend}")
+            if isListed:
+                listedSymbols.append(symbol)
+                listedTrends.append(trend)
+
+                # ADX
+                adx_result = adx_filter(data[0])
+                if adx_result is not None:
+                    adx_results.append({"Symbol": symbol, "Trend": trend, "Price": adx_result["close"],
+                                        "Volume": adx_result["volume"]})
+
+        df = pd.DataFrame(zip(listedSymbols, listedTrends), columns=["Symbol", "Trend"])
+        df.to_csv("output/ListedStock.csv", index=False)
+        print("\n===============================")
+        print("Screener Results")
+        print("¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯")
+        print(df)
+
+        # ADX
+        write_adx(adx_results)
+
+
+main()
